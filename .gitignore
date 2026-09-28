@@ -1,0 +1,11 @@
+# Go build artifacts
+pkg/
+*.so
+*.test
+
+# 6.824 handin tarballs / submission key
+*-handin.tar.gz
+api.key
+
+# macOS
+.DS_Store
