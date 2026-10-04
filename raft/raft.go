@@ -23,11 +23,11 @@ import (
 	"sync/atomic"
 	"time"
 
+
 	"../labrpc"
 )
-
-// import "bytes"
-// import "../labgob"
+import "bytes"
+import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -71,6 +71,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int // term of conlficting entry
+	XIndex  int // first index follower holds for XTerm
+	XLen    int // follower's log length
 }
 
 // [2A] not in Figure 2's State box — the figure implies it by having
@@ -183,6 +186,7 @@ func (rf *Raft) sendHeartbeats() {
 					rf.currentTerm = reply.Term
 					rf.role = Follower
 					rf.votedFor = -1
+					rf.persist()
 					return
 				}
 				if rf.currentTerm != args.Term || rf.role != Leader {
@@ -192,13 +196,50 @@ func (rf *Raft) sendHeartbeats() {
 				// [2B] success means the follower's log now matches ours
 				// through PrevLogIndex + len(Entries). Compute from args,
 				// not current state — the log may have grown since we sent.
+				// if reply.Success {
+				// 	rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+				// 	rf.nextIndex[server] = rf.matchIndex[server] + 1
+				// 	rf.updateCommitIndex()
+				// } else if rf.nextIndex[server] > 1 {
+				// 	// consistency check failed — back up one and retry
+				// 	rf.nextIndex[server]--
+				// }
+
 				if reply.Success {
-					rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-					rf.nextIndex[server] = rf.matchIndex[server] + 1
-					rf.updateCommitIndex()
-				} else if rf.nextIndex[server] > 1 {
-					// consistency check failed — back up one and retry
-					rf.nextIndex[server]--
+					match := args.PrevLogIndex + len(args.Entries)
+					if match > rf.matchIndex[server] { // never move backward
+						rf.matchIndex[server] = match
+						rf.nextIndex[server] = match + 1
+						rf.updateCommitIndex()
+					}
+					return
+				}
+
+				// stale rejection: nextIndex has moved since this RPC went out
+				if args.PrevLogIndex != rf.nextIndex[server]-1 {
+					return
+				}
+
+				if reply.XTerm == -1 {
+					// follower's log is too short: jump to its end
+					rf.nextIndex[server] = reply.XLen
+				} else {
+					// do we have any entry from XTerm?
+					last := -1
+					for j := args.PrevLogIndex; j >= 1; j-- {
+						if rf.log[j].Term == reply.XTerm {
+							last = j
+							break
+						}
+						if rf.log[j].Term < reply.XTerm {
+							break
+						}
+					}
+					if last != -1 {
+						rf.nextIndex[server] = last + 1 // we have XTerm: retry just past our last entry of it
+					} else {
+						rf.nextIndex[server] = reply.XIndex // we don't: skip the whole term
+					}
 				}
 			}(i, args)
 		}
@@ -215,6 +256,7 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.role = Candidate
 	rf.resetElectionDeadline()
+	rf.persist()
 
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
@@ -246,6 +288,7 @@ func (rf *Raft) startElection() {
 				rf.currentTerm = reply.Term
 				rf.role = Follower
 				rf.votedFor = -1
+				rf.persist()
 				return
 			}
 
@@ -296,16 +339,19 @@ func (rf *Raft) ticker() {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//
+// need to encode the state as array of bytes in order to pass it to persistor
+// use labgob encoder, prints error messages if try to encode structures with lower-case field names
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -328,6 +374,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		// decode failed, shouldn't happen in lab 2, might happen in lab 3
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // [2A] Figure 2's RequestVote box. LastLogIndex/LastLogTerm exist for the
@@ -364,6 +424,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.role = Follower
 		rf.votedFor = -1
 		reply.Term = rf.currentTerm
+		rf.persist()
 	}
 
 	// votedFor holds WHO, not whether — a duplicated request from the same
@@ -383,6 +444,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.resetElectionDeadline()
+		rf.persist()
 		return
 	}
 
@@ -408,6 +470,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	// outside the term check on purpose: a candidate hearing from a leader
@@ -420,8 +483,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// rule 2: consistency check
 	// do we have an entry at prevLogIndex with prevlogterm?
 	// if not, refuse: the leader will back up nextIndex
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	// if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	// 	reply.Success = false
+	// 	return
+	// }
+
+	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		reply.XTerm = -1
+		reply.XLen = len(rf.log)
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		idx := args.PrevLogIndex
+		for idx > 1 && rf.log[idx - 1].Term == reply.XTerm {
+			idx--
+		}
+		reply.XIndex = idx
+		reply.XLen = len(rf.log)
 		return
 	}
 
@@ -442,6 +524,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		}
 	}
+	rf.persist()
 
 	// rule 5: adopt the leader's commit point, bounded by what we actually have
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -518,6 +601,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// stamping with currentTerm is what makes the 5.4.2 commit rule possible
 	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
+	rf.persist()
 	index := len(rf.log) - 1
 
 	return index, rf.currentTerm, true
